@@ -9,7 +9,7 @@ import numpy as np
 import joblib
 from datetime import datetime
 from scipy.stats import poisson
-
+import json
 
 def _get_opener():
     ctx = ssl.create_default_context()
@@ -149,17 +149,49 @@ def predecir_partido(df, m_loc, m_vis, local, visitante):
     return g_loc, g_vis, p1, px, p2
 
 
+### 1. Asegúrate de cargar las features permitidas (si usas un features.json)
+with open('features.json', 'r') as f:
+    features_esperadas = json.load(f)
+
 def predecir_simulador_manual(m_loc, m_vis, h2h_gl, h2h_gv, h2h_tl, h2h_tv):
-    datos = pd.DataFrame.from_records([{
-        'H2H_Goles_Local': float(h2h_gl), 'H2H_Goles_Visitante': float(h2h_gv),
-        'H2H_Tiros_Local': float(h2h_tl), 'H2H_Tiros_Visitante': float(h2h_tv)
-    }])
+    # 1. Cargar las features esperadas por el modelo desde el archivo JSON
+    with open('features.json', 'r') as f:
+        features_esperadas = json.load(f)
+
+    # 2. Construir el diccionario con los datos del simulador manual
+    datos_dict = {
+        'Dif_Valoracion': [h2h_tl - h2h_tv],
+        'H2H_xG_Local': [h2h_gl],
+        'H2H_xG_Visitante': [h2h_gv],
+        'Valoracion_Local': [h2h_tl],
+        'Valoracion_Visitante': [h2h_tv],
+    }
+    
+    datos = pd.DataFrame(datos_dict)
+    
+    # 3. Alinear automáticamente las columnas con las que entrenó el modelo
+    for col in features_esperadas:
+        if col not in datos.columns:
+            datos[col] = 0.0
+            
+    datos = datos[features_esperadas]
+
+    # 4. Predicción de goles de forma segura
     g_loc = max(0.1, float(m_loc.predict(datos).item()))
     g_vis = max(0.1, float(m_vis.predict(datos).item()))
-    mat = np.outer([poisson.pmf(i, g_loc) for i in range(7)], [poisson.pmf(i, g_vis) for i in range(7)])
-    p1 = round(float(np.sum(np.tril(mat, -1))) * 100, 1)
-    px = round(float(np.sum(np.diag(mat))) * 100, 1)
-    p2 = round(float(np.sum(np.triu(mat, 1))) * 100, 1)
+    
+    # 5. Cálculo de matriz de Poisson para probabilidades (si aplica en tu lógica)
+    from scipy.stats import poisson
+    max_goles = 6
+    mat = np.outer(
+        [poisson.pmf(i, g_loc) for i in range(max_goles)],
+        [poisson.pmf(j, g_vis) for j in range(max_goles)]
+    )
+    
+    p1 = round(float(np.sum(np.tril(mat, -1))) * 100, 1) # Victoria local
+    px = round(float(np.sum(np.diag(mat))) * 100, 1)     # Empate
+    p2 = round(float(np.sum(np.triu(mat, 1))) * 100, 1)  # Victoria visitante
+    
     return g_loc, g_vis, p1, px, p2
 
 
@@ -428,6 +460,69 @@ def _estrellas_laliga_base():
         ("Ayoze Pérez", "Villarreal", "DEL", 7, 11, 8.05, 84),
         ("Ante Budimir", "Osasuna", "DEL", 6, 12, 7.75, 76)
     ]
+
+# ==============================================================================
+# SECCIÓN 3: ACTUALIZACIÓN DEL MOTOR PREDICTIVO (motor.py)
+# ==============================================================================
+import pandas as pd
+import numpy as np
+from scipy.stats import poisson
+
+VALORACIONES_EQUIPOS = {
+    "Real Madrid": 8.5, "Barcelona": 8.4, "Ath Madrid": 8.0, "Ath Bilbao": 7.7,
+    "Villarreal": 7.6, "Betis": 7.5, "Sociedad": 7.5, "Girona": 7.4,
+    "Sevilla": 7.3, "Valencia": 7.2, "Celta": 7.2, "Osasuna": 7.1,
+    "Mallorca": 7.0, "Rayo Vallecano": 7.0, "Getafe": 6.9, "Alaves": 6.8,
+    "Espanyol": 6.8, "Las Palmas": 6.7, "Leganes": 6.6, "Valladolid": 6.5
+}
+
+def predecir_partido(df, m_loc, m_vis, local, visitante):
+    """
+    Predice el resultado empleando las 9 variables con las que se entrenó el modelo.
+    """
+    duelos = df[(df['Equipo_Local'] == local) & (df['Equipo_Visitante'] == visitante)].tail(8)
+    
+    val_loc = float(VALORACIONES_EQUIPOS.get(local, 7.0))
+    val_vis = float(VALORACIONES_EQUIPOS.get(visitante, 7.0))
+    dif_val = val_loc - val_vis
+    
+    if duelos.empty:
+        gl_m = df[df['Equipo_Local'] == local]['Goles_Local_Final'].tail(10).mean()
+        gv_m = df[df['Equipo_Visitante'] == visitante]['Goles_Visitante_Final'].tail(10).mean()
+        h2h_gl = 1.3 if pd.isna(gl_m) else float(gl_m)
+        h2h_gv = 1.0 if pd.isna(gv_m) else float(gv_m)
+        h2h_tl, h2h_tv = 4.5, 3.5
+        h2h_xg_l, h2h_xg_v = h2h_tl * 0.30, h2h_tv * 0.30
+    else:
+        h2h_gl = float(duelos['Goles_Local_Final'].mean())
+        h2h_gv = float(duelos['Goles_Visitante_Final'].mean())
+        h2h_tl = float(duelos['Tiros_A_Puerta_Local'].mean())
+        h2h_tv = float(duelos['Tiros_A_Puerta_Visitante'].mean())
+        h2h_xg_l = float(duelos['xG_Local'].mean()) if 'xG_Local' in duelos.columns else h2h_tl * 0.30
+        h2h_xg_v = float(duelos['xG_Visitante'].mean()) if 'xG_Visitante' in duelos.columns else h2h_tv * 0.30
+
+    # DataFrame con las 9 variables exactas de entrenamiento
+    datos = pd.DataFrame.from_records([{
+        'H2H_Goles_Local': h2h_gl,
+        'H2H_Goles_Visitante': h2h_gv,
+        'H2H_Tiros_Local': h2h_tl,
+        'H2H_Tiros_Visitante': h2h_tv,
+        'H2H_xG_Local': h2h_xg_l,
+        'H2H_xG_Visitante': h2h_xg_v,
+        'Valoracion_Local': val_loc,
+        'Valoracion_Visitante': val_vis,
+        'Dif_Valoracion': dif_val
+    }]).fillna(1.0)
+
+    g_loc = max(0.1, float(m_loc.predict(datos).item()))
+    g_vis = max(0.1, float(m_vis.predict(datos).item()))
+
+    mat = np.outer([poisson.pmf(i, g_loc) for i in range(7)], [poisson.pmf(i, g_vis) for i in range(7)])
+    p1 = round(float(np.sum(np.tril(mat, -1))) * 100, 1)
+    px = round(float(np.sum(np.diag(mat))) * 100, 1)
+    p2 = round(float(np.sum(np.triu(mat, 1))) * 100, 1)
+
+    return g_loc, g_vis, p1, px, p2
 
 
 def obtener_datos_jornada_y_pichichi(eq_sel, jornada_num=None):
